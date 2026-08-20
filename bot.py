@@ -1396,6 +1396,33 @@ async def cmd_broadcast(message: Message, state: FSMContext):
 # MAIN
 # ============================================================================
 
+async def self_ping_loop():
+    """Pings its own external URL every 10 minutes to stay awake on Render Free Tier."""
+    await asyncio.sleep(60)  # Wait for startup
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        logger.info("RENDER_EXTERNAL_URL not found. Self-ping disabled.")
+        return
+
+    logger.info("Self-ping loop started targeting: %s", url)
+    client = requests.Session()
+    client.verify = False
+    client.mount('https://', SSLAdapter())
+
+    while True:
+        try:
+            def _ping():
+                return client.get(url, timeout=15)
+
+            loop = asyncio.get_event_loop()
+            r = await loop.run_in_executor(executor, _ping)
+            logger.info("Self-ping status: %s", r.status_code)
+        except Exception as e:
+            logger.warning("Self-ping failed: %s", e)
+
+        await asyncio.sleep(600)  # Ping every 10 minutes
+
+
 async def main():
     logger.info("Starting Whop Checkout Bot (owner=%s)", OWNER_ID)
 
@@ -1416,6 +1443,9 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logger.info("Dummy web server started on port %s to satisfy Render health checks", port)
+
+    # Start the self-ping loop in the background
+    asyncio.create_task(self_ping_loop())
 
     await dp.start_polling(bot, skip_updates=True)
 
