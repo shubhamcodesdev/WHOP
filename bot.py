@@ -1398,6 +1398,25 @@ async def cmd_broadcast(message: Message, state: FSMContext):
 
 async def main():
     logger.info("Starting Whop Checkout Bot (owner=%s)", OWNER_ID)
+
+    # Set up a dummy web server on the Render PORT (required for Web Services on free tier)
+    from aiohttp import web
+
+    async def handle_ping(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    app.router.add_get('/health', handle_ping)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", "8080"))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info("Dummy web server started on port %s to satisfy Render health checks", port)
+
     await dp.start_polling(bot, skip_updates=True)
 
 
