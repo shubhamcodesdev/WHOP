@@ -1325,6 +1325,7 @@ async def _process_cc(message: Message, state: FSMContext):
                 or result.get("error")
                 or "Unknown error"
             )
+            # Build detailed decline message
             text = (
                 f"❌ <b>DECLINED</b>\n\n"
                 f"💳 Card: <code>{card_display}</code>\n"
@@ -1333,6 +1334,15 @@ async def _process_cc(message: Message, state: FSMContext):
             )
             if result.get("failure_stage"):
                 text += f"📊 Stage: <code>{result['failure_stage']}</code>\n"
+            chk_status = result.get("checkout_status", "")
+            if chk_status and chk_status not in ("idle",):
+                text += f"🔄 Status: <code>{chk_status}</code>\n"
+            # Hint for generic "Payment failed"
+            if str(failure).lower() in ("payment failed", "unknown error", "none"):
+                text += (
+                    "\n💡 <i>Generic decline — likely causes: dead card, "
+                    "AVS/billing mismatch, BIN blocked, or flagged proxy.</i>"
+                )
 
         await msg.edit_text(text, parse_mode="HTML")
 
