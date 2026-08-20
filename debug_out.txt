@@ -1,5 +1,60 @@
-﻿Context around plan_:
-'ring in real time. Global politics, war coverage, geopolitical shifts, and everything in between. No noise, no spin, just the signal.</p><p><br/></p><p>$90/month. 30% affiliate commission if you want to share it.</p><p><br/></p><p>ΓåÆ <span role="none" tabindex="-1"><a href="https://whop.com/checkout/plan_QVOSmgcqgwQN6" class="text-accent-a11 hover:bg-accent-a3 relative cursor-pointer after:absolute after:-inset-x-1 after:-inset-y-0.5 after:rounded after:opacity-0 hover:underline" target="_blank" rel="noopener noreferrer" role="button" tabindex="0" data-base-ui-click-trigger="" id="base-ui-_R_dk'
+﻿
+============================================================
+Testing: https://whop.com/thehoovement/products/thehoovement/
+============================================================
 
----
+[1] Resolving URL...
+  Trying candidates: ['https://whop.com/thehoovement/products/thehoovement/', 'https://whop.com/thehoovement/']
+  https://whop.com/thehoovement/products/thehoovement/ ΓåÆ 200
+  funnel_id:  None
+  plan_id:    plan_9WzF6zSnIDIGE
+  affiliate:  arnobrip69
 
+[2] Creating checkout session...
+  Response: 201
+  Γ£à Checkout session created!
+  checkout_id: 6mY0hwPVg4u0L3SMN-zfYy-TvEK-2cCD-wO6hNClhSQ7K
+  secret:      eyJhbGciOiJkaXIiLCJl...
+  public_key:  key_prod_us_pub_3gzPRk4Fuomp1aXof2qYWw
+
+  Γ£à SUCCESS ΓÇö can proceed to card tokenization + payment
+
+============================================================
+Testing: https://whop.com/mire-trades/forex-mastery-bundle-a5?a=shubhamind29
+============================================================
+
+[1] Resolving URL...
+  Trying candidates: ['https://whop.com/mire-trades/forex-mastery-bundle-a5/', 'https://whop.com/forex-mastery-bundle-a5/']
+  https://whop.com/mire-trades/forex-mastery-bundle-a5/ ΓåÆ 200
+  funnel_id:  None
+  plan_id:    plan_aZZNsSvxHMfo4
+  affiliate:  shubhamind29
+
+[2] Creating checkout session...
+  Response: 201
+  Γ£à Checkout session created!
+  checkout_id: 6JjJmASrquUXFCzY0F-F2ES-HZhZ-YDi3-O0reMAaRJlpp
+  secret:      eyJhbGciOiJkaXIiLCJl...
+  public_key:  key_prod_us_pub_3gzPRk4Fuomp1aXof2qYWw
+
+  Γ£à SUCCESS ΓÇö can proceed to card tokenization + payment
+
+============================================================
+Testing: https://whop.com/politics-intel/
+============================================================
+
+[1] Resolving URL...
+  Trying candidates: ['https://whop.com/politics-intel/']
+  https://whop.com/politics-intel/ ΓåÆ 200
+  funnel_id:  None
+  plan_id:    plan_QVOSmgcqgwQN6
+  affiliate:  arnobrip69
+
+[2] Creating checkout session...
+  Response: 201
+  Γ£à Checkout session created!
+  checkout_id: 62HbGhQMIUR5Pk1QYh-Q00T-hzYL-ByJ1-w7sXTeD24944
+  secret:      eyJhbGciOiJkaXIiLCJl...
+  public_key:  key_prod_us_pub_3gzPRk4Fuomp1aXof2qYWw
+
+  Γ£à SUCCESS ΓÇö can proceed to card tokenization + payment

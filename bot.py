@@ -431,12 +431,14 @@ class BrowserProfile:
 
 
 class WhopCheckout:
-    def __init__(self, debug=False, proxy: dict = None):
-        self.session  = requests.Session()
-        self.base_url = "https://whop.com"
-        self.debug    = debug
-        self.proxy    = proxy
-        self.profile  = BrowserProfile()   # unique fingerprint per checkout instance
+    def __init__(self, debug=False, proxy: dict = None, affiliate_code: str = None):
+        self.session        = requests.Session()
+        self.base_url       = "https://whop.com"
+        self.debug          = debug
+        self.proxy          = proxy
+        self.affiliate_code = affiliate_code or "arnobrip69"
+        self.product_url    = None   # set during checkout for referer accuracy
+        self.profile        = BrowserProfile()   # unique fingerprint per checkout instance
 
         if proxy:
             self.session.proxies.update(proxy)
@@ -484,6 +486,12 @@ class WhopCheckout:
     def _uuid(self) -> str:
         return f"{self._rstr(8)}-{self._rstr(4)}-{self._rstr(4)}-{self._rstr(4)}-{self._rstr(12)}"
 
+    def _referer(self) -> str:
+        """Builds referer with affiliate code for all API calls."""
+        base = self.product_url or f"{self.base_url}/"
+        sep  = '&' if '?' in base else '?'
+        return f"{base.rstrip('/')}/{sep}a={self.affiliate_code}"
+
     def _setup_cookies(self):
         for k, v in {
             '__Host-whop-core.csrf-token':   self.csrf_token,
@@ -494,8 +502,8 @@ class WhopCheckout:
             'ajs_anonymous_id':              self.anonymous_id,
             'whop-frosted-theme':            'appearance:light',
             'whop-theme-resolved':           'light',
-            'affiliate_code':                'arnobrip69',
-            'whop-core.affiliate-toolsuite': 'arnobrip69',
+            'affiliate_code':                self.affiliate_code,
+            'whop-core.affiliate-toolsuite': self.affiliate_code,
         }.items():
             self.session.cookies.set(k, v, domain='.whop.com')
 
@@ -514,80 +522,129 @@ class WhopCheckout:
         Resolve any Whop URL format and extract (funnel_id, plan_id).
 
         Handles:
-          1. Direct buy page — has funnelId + defaultPlan in JSON
-          2. Product landing page — has /checkout/plan_xxx href → follow it
-          3. /products/ subpath — strip to slug root and retry
-          4. /checkout/plan_xxx direct URL — plan_id in URL itself
+          1. Direct buy page        — has funnelId + defaultPlan in JSON
+          2. /username/products/slug — strips /products/, retries
+          3. /username/slug          — two-segment user-scoped URL, try as-is first
+          4. Product landing page   — plan_id as raw text token in HTML
+          5. /checkout/plan_xxx     — plan_id in URL itself
+          6. Affiliate ?a= param    — stored as self.affiliate_code
         """
+        # Extract and strip affiliate code from URL
+        from urllib.parse import urlparse, parse_qs
+        parsed   = urlparse(product_url)
+        qs       = parse_qs(parsed.query)
+        aff      = qs.get('a', [None])[0]
+        if aff:
+            self.affiliate_code = aff
+            self._setup_cookies()   # refresh cookies with new affiliate code
+        clean_url = product_url.split('?')[0].rstrip('/') + '/'
+        self.product_url = clean_url
+
         def _try_extract(text: str):
             funnel_id = plan_id = None
             for pat in [
                 r'"funnelId"\s*:\s*"(product_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
-                r'\\\"funnelId\\\"\s*:\s*\\\"(product_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\\"',
+                r'\\"funnelId\\"\s*:\s*\\"(product_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\"',
             ]:
                 m = re.search(pat, text)
                 if m:
                     funnel_id = m.group(1); break
             for pat in [
                 r'"defaultPlan"\s*:\s*\{\s*"id"\s*:\s*"(plan_[A-Za-z0-9]+)"',
-                r'\\\"defaultPlan\\\"\s*:\s*\{\s*\\\"id\\\"\s*:\s*\\\"(plan_[A-Za-z0-9]+)\\\"',
+                r'\\"defaultPlan\\"\s*:\s*\{\s*\\"id\\"\s*:\s*\\"(plan_[A-Za-z0-9]+)\\"',
             ]:
                 m = re.search(pat, text)
                 if m:
                     plan_id = m.group(1); break
             return funnel_id, plan_id
 
-        # Strip /products/ subpath (e.g. /steven/products/politics-intel/ → /politics-intel/)
-        clean_url = re.sub(r'/[^/]+/products/([^/]+)/?$', r'/\1/', product_url)
+        def _broad_plan_id(text: str):
+            """
+            Fallback: find any plan_Xxxx token in the page.
+            Real IDs always contain at least one uppercase letter (not 'plan_successfully' etc).
+            """
+            candidates = re.findall(r'plan_([A-Za-z0-9]{8,})', text)
+            for c in candidates:
+                if any(ch.isupper() for ch in c):   # real IDs have uppercase
+                    return f'plan_{c}'
+            return None
 
-        r = self.session.get(clean_url)
-        if r.status_code == 404:
-            # Try without username prefix
-            slug = clean_url.rstrip('/').rsplit('/', 1)[-1]
-            clean_url = f"{self.base_url}/{slug}/"
-            r = self.session.get(clean_url)
-        if r.status_code != 200:
-            raise Exception(f"Failed to load product page: {r.status_code} — {clean_url}")
+        def _fetch(url: str):
+            try:
+                r = self.session.get(url)
+                return r if r.status_code == 200 else None
+            except Exception:
+                return None
 
-        funnel_id, plan_id = _try_extract(r.text)
+        # ---- URL normalisation strategies ----
+        # 1. Try original URL as-is (most specific first)
+        # 2. /username/products/slug/ → /slug/
+        url_no_products = re.sub(
+            r'(https://whop\.com)/[^/]+/products/([^/]+)/?$',
+            r'\1/\2/', clean_url
+        )
+        # 3. /username/slug/ → /slug/ (strip username prefix)
+        path_parts = [p for p in parsed.path.strip('/').split('/') if p]
+        url_no_user = (f"{self.base_url}/{path_parts[-1]}/"
+                       if len(path_parts) >= 2 else None)
+        # 4. /checkout/plan_xxx already in URL
+        url_checkout_in_url = re.search(r'/checkout/(plan_[A-Za-z0-9]+)', clean_url)
 
-        # If plan_id not found yet, look for /checkout/plan_xxx href and follow it
-        if not plan_id:
-            m = re.search(r'href=["\']https://whop\.com/checkout/(plan_[A-Za-z0-9]+)', r.text)
-            if m:
-                plan_id = m.group(1)
-                checkout_url = f"{self.base_url}/checkout/{plan_id}"
-                r2 = self.session.get(checkout_url)
-                if r2.status_code == 200:
-                    funnel_id2, plan_id2 = _try_extract(r2.text)
-                    funnel_id = funnel_id2 or funnel_id
-                    plan_id   = plan_id2   or plan_id
+        # Build ordered deduped candidate list — try original first, then simplifications
+        candidates_urls = list(dict.fromkeys(filter(None, [
+            clean_url,            # 1. original as-is
+            url_no_products,      # 2. without /products/ segment
+            url_no_user,          # 3. without username prefix
+        ])))
 
-        # If plan_id in the URL itself (e.g. /checkout/plan_xxx)
-        if not plan_id:
-            m = re.search(r'/checkout/(plan_[A-Za-z0-9]+)', product_url)
-            if m:
-                plan_id = m.group(1)
+        # Try all candidates — pick first one that yields a plan_id
+        page = funnel_id = plan_id = None
+        for try_url in candidates_urls:
+            r = _fetch(try_url)
+            if not r:
+                continue
+            f, p = _try_extract(r.text)
+            if not p:
+                p = _broad_plan_id(r.text)
+            if not p:
+                m = re.search(r'href=["\']https://whop\.com/checkout/(plan_[A-Za-z0-9]+)', r.text)
+                if m:
+                    p = m.group(1)
+            if p:
+                funnel_id, plan_id, page = f, p, r
+                break
+            elif not page:
+                page = r   # keep a page ref even if no plan found
+
+        # plan_id baked into the original URL itself
+        if not plan_id and url_checkout_in_url:
+            plan_id = url_checkout_in_url.group(1)
+
+        if not page:
+            raise Exception(f"Failed to load product page — tried: {candidates_urls}")
 
         if not plan_id:
             raise Exception(
                 "Could not find plan ID.\n\n"
-                "Try using the direct buy URL instead:\n"
+                "Try the direct checkout URL:\n"
                 "<code>https://whop.com/checkout/plan_XXXXXX</code>"
             )
 
-        # funnel_id can be None for plan-only checkouts — Whop handles it
         return funnel_id or "", plan_id
 
     def create_checkout_session(self, funnel_id: str, plan_id: str) -> Dict:
         url     = f"{self.base_url}/checkout/api/"
+        ret_to  = ('/' + '/'.join(self.product_url.replace(self.base_url, '').strip('/').split('/')[:2]) + '/'
+                   if self.product_url else '/')
         payload = {"plan_id": plan_id, "amount": 1, "d2c": True,
-                   "return_to": "/toolsuite/buy-vip/", "referring_plan_id": None,
-                   "tracking_link_id": None, "utm": {},
+                   "return_to": ret_to, "referring_plan_id": None,
+                   "tracking_link_id": None,
+                   "utm": {"utm_source": "whop", "utm_medium": "affiliate",
+                           "utm_campaign": self.affiliate_code},
                    "user_agent": self.profile.user_agent,
-                   "source": "product_page_direct", "funnel_id": funnel_id}
+                   "source": "product_page_direct", "funnel_id": funnel_id or None}
         headers = {'content-type': 'text/plain;charset=UTF-8', 'x-csrf': self.csrf_token,
-                   'origin': self.base_url, 'referer': f"{self.base_url}/toolsuite/buy-vip/?a=arnobrip69",
+                   'origin': self.base_url, 'referer': self._referer(),
                    'priority': 'u=1, i'}
         r = self.session.post(url, json=payload, headers=headers)
         if r.status_code not in [200, 201]:
@@ -609,7 +666,7 @@ class WhopCheckout:
         headers = {'content-type': 'text/plain;charset=UTF-8',
                    'x-whop-anonymous-id': self.anonymous_id,
                    'origin': self.base_url,
-                   'referer': f"{self.base_url}/toolsuite/buy-vip/?a=arnobrip69",
+                   'referer': self._referer(),
                    'priority': 'u=1, i'}
         r = self.session.patch(url, json={"email_preload": email}, headers=headers)
         if r.status_code not in [200, 201]:
@@ -657,7 +714,7 @@ class WhopCheckout:
             'content-type':       'text/plain;charset=UTF-8',
             'origin':             self.base_url,
             'priority':           'u=1, i',
-            'referer':            f"{self.base_url}/toolsuite/buy-vip/?a=arnobrip69",
+            'referer':            self._referer(),
             'sec-ch-ua':          self.profile.sec_ch_ua,
             'sec-ch-ua-mobile':   '?0',
             'sec-ch-ua-platform': f'"{self.profile.platform_name}"',
@@ -686,13 +743,18 @@ class WhopCheckout:
         if not self.checkout_id or not self.secret:
             raise Exception("No checkout session")
         headers = {
-            'accept': '*/*', 'accept-language': 'en-US,en;q=0.6', 'priority': 'u=1, i',
-            'referer': f"{self.base_url}/toolsuite/buy-vip/?a=arnobrip69",
-            'sec-ch-ua': '"Not=A?Brand";v="99", "Brave";v="151", "Chromium";v="151"',
-            'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin', 'sec-gpc': '1',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+            'accept':             '*/*',
+            'accept-language':    self.profile.accept_language,
+            'priority':           'u=1, i',
+            'referer':            self._referer(),
+            'sec-ch-ua':          self.profile.sec_ch_ua,
+            'sec-ch-ua-mobile':   '?0',
+            'sec-ch-ua-platform': f'"{self.profile.platform_name}"',
+            'sec-fetch-dest':     'empty',
+            'sec-fetch-mode':     'cors',
+            'sec-fetch-site':     'same-origin',
+            'sec-gpc':            '1',
+            'user-agent':         self.profile.user_agent,
         }
         for attempt in range(max_retries):
             r      = self.session.get(self.checkout_api_url, params={'secret': self.secret}, headers=headers)
@@ -843,16 +905,22 @@ def is_approved(uid: int) -> bool:
 
 def _build_proxy_dict(proxy_str: str) -> dict:
     s = proxy_str.strip()
-    if re.match(r'^https?://', s) or re.match(r'^socks[45]://', s):
+    # Already has scheme prefix (http://, https://, socks4://, socks5://)
+    if re.match(r'^(https?|socks[45])://', s):
         return {'http': s, 'https': s}
+    # user:pass@host:port (no scheme)
+    if '@' in s:
+        return {'http': f'http://{s}', 'https': f'http://{s}'}
     parts = s.split(':')
     if len(parts) == 2:
+        # host:port
         return {'http': f'http://{s}', 'https': f'http://{s}'}
     if len(parts) == 4:
+        # host:port:user:pass
         host, port, user, pwd = parts
         auth = f'{user}:{pwd}@{host}:{port}'
         return {'http': f'http://{auth}', 'https': f'http://{auth}'}
-    raise ValueError("Invalid proxy format. Use host:port or host:port:user:pass")
+    raise ValueError("Invalid proxy format. Supported: host:port | host:port:user:pass | user:pass@host:port | http://...")
 
 
 def _test_proxy_sync(proxy_str: str) -> bool:
@@ -925,18 +993,19 @@ async def access_check(message: Message, require_proxy: bool = True) -> bool:
 # ASYNC WRAPPERS (run sync whop.py code in thread pool)
 # ============================================================================
 
-async def async_validate_url(url: str, proxy: dict = None):
-    loop = asyncio.get_event_loop()
-    checkout = WhopCheckout(debug=False, proxy=proxy)
+async def async_validate_url(url: str, proxy: dict = None, affiliate_code: str = None):
+    loop     = asyncio.get_event_loop()
+    checkout = WhopCheckout(debug=False, proxy=proxy, affiliate_code=affiliate_code)
     return await loop.run_in_executor(executor, checkout.get_product_page, url)
 
 
-async def async_checkout(product_url: str, card_info: dict, proxy: dict = None) -> dict:
+async def async_checkout(product_url: str, card_info: dict,
+                         proxy: dict = None, affiliate_code: str = None) -> dict:
     loop    = asyncio.get_event_loop()
     billing = get_random_billing()
 
     def _run():
-        checkout = WhopCheckout(debug=False, proxy=proxy)
+        checkout = WhopCheckout(debug=False, proxy=proxy, affiliate_code=affiliate_code)
         return checkout.process_with_temp_email(
             card_info=card_info,
             billing_address=billing,
@@ -1111,12 +1180,16 @@ async def _process_product_url(message: Message, state: FSMContext, url: str):
 
     msg   = await message.answer("🔍 <b>Validating product URL...</b>", parse_mode="HTML")
     proxy = get_user_proxy(uid)
+    # Extract affiliate code from URL (e.g. ?a=shubhamind29)
+    from urllib.parse import urlparse, parse_qs
+    aff_match = parse_qs(urlparse(url).query).get('a', [None])[0]
     try:
-        funnel_id, plan_id = await async_validate_url(url, proxy=proxy)
+        funnel_id, plan_id = await async_validate_url(url, proxy=proxy, affiliate_code=aff_match)
         d = get_user(uid)
-        d["product_url"] = url
-        d["funnel_id"]   = funnel_id
-        d["plan_id"]     = plan_id
+        d["product_url"]    = url
+        d["funnel_id"]      = funnel_id
+        d["plan_id"]        = plan_id
+        d["affiliate_code"] = aff_match   # persist so checkout uses it later
         await state.set_state(S.idle)
         await msg.edit_text(
             f"✅ <b>Product saved!</b>\n\n"
@@ -1199,6 +1272,7 @@ async def _process_cc(message: Message, state: FSMContext):
         pass
 
     proxy        = get_user_proxy(uid)
+    aff_code     = d.get("affiliate_code")
     card_display = f"{card_info['number'][:6]}xxxxxx{card_info['number'][-4:]}"
     billing      = get_random_billing()
     proxy_raw    = user_proxies.get(uid, [])
@@ -1217,7 +1291,7 @@ async def _process_cc(message: Message, state: FSMContext):
     )
 
     try:
-        result = await async_checkout(product_url, card_info, proxy=proxy)
+        result = await async_checkout(product_url, card_info, proxy=proxy, affiliate_code=aff_code)
 
         if result.get("success"):
             text = (
@@ -1280,43 +1354,93 @@ async def _process_cc(message: Message, state: FSMContext):
 async def cmd_addproxy(message: Message, state: FSMContext):
     if not await access_check(message, require_proxy=False):
         return
-    uid       = message.from_user.id
-    proxy_str = message.text.partition(" ")[2].strip()
-    if not proxy_str:
+    uid      = message.from_user.id
+    raw_text = message.text.partition(" ")[2].strip()
+
+    # Support: /addproxy sent as a REPLY to a .txt file
+    if not raw_text and message.reply_to_message:
+        doc = message.reply_to_message.document
+        if doc and (doc.mime_type == 'text/plain' or doc.file_name.endswith('.txt')):
+            wait_msg = await message.answer("📄 <b>Downloading proxy file...</b>", parse_mode="HTML")
+            try:
+                file_info = await bot.get_file(doc.file_id)
+                dl        = await bot.download_file(file_info.file_path)
+                raw_text  = dl.read().decode('utf-8', errors='ignore')
+                await wait_msg.delete()
+            except Exception as e:
+                await wait_msg.edit_text(f"❌ Failed to download file: {e}")
+                return
+
+    if not raw_text:
         await message.answer(
             "<b>Usage:</b> /addproxy &lt;proxy&gt;\n\n"
+            "You can paste <b>multiple proxies</b> at once (one per line).\n\n"
             "Supported formats:\n"
             "  <code>host:port</code>\n"
             "  <code>host:port:user:pass</code>\n"
+            "  <code>user:pass@host:port</code>\n"
             "  <code>http://user:pass@host:port</code>\n"
             "  <code>socks5://user:pass@host:port</code>",
             parse_mode="HTML",
         )
         return
-    try:
-        _build_proxy_dict(proxy_str)
-    except ValueError as e:
-        await message.answer(f"❌ {e}")
-        return
 
-    msg = await message.answer("🔍 <b>Testing proxy...</b>", parse_mode="HTML")
-    ok  = await test_proxy(proxy_str)
-    if not ok:
-        await msg.edit_text(
-            f"❌ <b>Proxy failed!</b>\n\n<code>{proxy_str}</code>\n\nUnreachable or blocked. Not added.",
+    # Parse all lines — filter blanks and validate format
+    lines       = [l.strip() for l in raw_text.splitlines() if l.strip()]
+    valid, bad  = [], []
+    for line in lines:
+        try:
+            _build_proxy_dict(line)
+            valid.append(line)
+        except ValueError:
+            bad.append(line)
+
+    if not valid:
+        await message.answer(
+            f"❌ <b>No valid proxies found.</b>\n\n"
+            f"Bad lines:\n" + "\n".join(f"<code>{b}</code>" for b in bad[:10]),
             parse_mode="HTML",
         )
         return
 
+    if len(valid) == 1:
+        msg = await message.answer("🔍 <b>Testing proxy...</b>", parse_mode="HTML")
+    else:
+        msg = await message.answer(
+            f"🔍 <b>Testing {len(valid)} proxies in parallel...</b>",
+            parse_mode="HTML",
+        )
+
+    # Test all valid proxies concurrently
+    results = await asyncio.gather(*[test_proxy(p) for p in valid])
+
     if uid not in user_proxies:
         user_proxies[uid] = []
-    if proxy_str in user_proxies[uid]:
-        await msg.edit_text("⚠️ Proxy already in your list.", parse_mode="HTML")
-        return
-    user_proxies[uid].append(proxy_str)
-    count = len(user_proxies[uid])
+
+    added = dupes = failed_list = 0
+    lines_out = []
+    for proxy_str, ok in zip(valid, results):
+        if not ok:
+            lines_out.append(f"❌ <code>{proxy_str}</code>")
+            failed_list += 1
+        elif proxy_str in user_proxies[uid]:
+            lines_out.append(f"⚠️ <code>{proxy_str}</code> (already in list)")
+            dupes += 1
+        else:
+            user_proxies[uid].append(proxy_str)
+            lines_out.append(f"✅ <code>{proxy_str}</code>")
+            added += 1
+
+    total = len(user_proxies[uid])
+    summary = f"✅ Added: {added}  ❌ Dead: {failed_list}  ⚠️ Dupes: {dupes}"
+    if bad:
+        summary += f"  🚫 Invalid format: {len(bad)}"
+
+    body = "\n".join(lines_out[:30])  # cap at 30 lines to avoid Telegram msg limit
     await msg.edit_text(
-        f"✅ <b>Proxy added!</b> (#{count})\n\n<code>{proxy_str}</code>\n\nYou now have {count} proxy(s).",
+        f"📋 <b>Proxy import results:</b>\n\n{body}\n\n"
+        f"{summary}\n"
+        f"🌐 You now have <b>{total}</b> proxy(s).",
         parse_mode="HTML",
     )
 
