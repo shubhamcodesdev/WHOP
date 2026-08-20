@@ -510,27 +510,74 @@ class WhopCheckout:
         return self.current_email
 
     def get_product_page(self, product_url: str) -> Tuple[str, str]:
-        r = self.session.get(product_url)
+        """
+        Resolve any Whop URL format and extract (funnel_id, plan_id).
+
+        Handles:
+          1. Direct buy page — has funnelId + defaultPlan in JSON
+          2. Product landing page — has /checkout/plan_xxx href → follow it
+          3. /products/ subpath — strip to slug root and retry
+          4. /checkout/plan_xxx direct URL — plan_id in URL itself
+        """
+        def _try_extract(text: str):
+            funnel_id = plan_id = None
+            for pat in [
+                r'"funnelId"\s*:\s*"(product_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
+                r'\\\"funnelId\\\"\s*:\s*\\\"(product_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\\"',
+            ]:
+                m = re.search(pat, text)
+                if m:
+                    funnel_id = m.group(1); break
+            for pat in [
+                r'"defaultPlan"\s*:\s*\{\s*"id"\s*:\s*"(plan_[A-Za-z0-9]+)"',
+                r'\\\"defaultPlan\\\"\s*:\s*\{\s*\\\"id\\\"\s*:\s*\\\"(plan_[A-Za-z0-9]+)\\\"',
+            ]:
+                m = re.search(pat, text)
+                if m:
+                    plan_id = m.group(1); break
+            return funnel_id, plan_id
+
+        # Strip /products/ subpath (e.g. /steven/products/politics-intel/ → /politics-intel/)
+        clean_url = re.sub(r'/[^/]+/products/([^/]+)/?$', r'/\1/', product_url)
+
+        r = self.session.get(clean_url)
+        if r.status_code == 404:
+            # Try without username prefix
+            slug = clean_url.rstrip('/').rsplit('/', 1)[-1]
+            clean_url = f"{self.base_url}/{slug}/"
+            r = self.session.get(clean_url)
         if r.status_code != 200:
-            raise Exception(f"Failed to load product page: {r.status_code}")
-        funnel_id = plan_id = None
-        for pat in [
-            r'"funnelId"\s*:\s*"(product_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
-            r'\\\"funnelId\\\"\s*:\s*\\\"(product_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\\"',
-        ]:
-            m = re.search(pat, r.text)
+            raise Exception(f"Failed to load product page: {r.status_code} — {clean_url}")
+
+        funnel_id, plan_id = _try_extract(r.text)
+
+        # If plan_id not found yet, look for /checkout/plan_xxx href and follow it
+        if not plan_id:
+            m = re.search(r'href=["\']https://whop\.com/checkout/(plan_[A-Za-z0-9]+)', r.text)
             if m:
-                funnel_id = m.group(1); break
-        for pat in [
-            r'"defaultPlan"\s*:\s*\{\s*"id"\s*:\s*"(plan_[A-Za-z0-9]+)"',
-            r'\\\"defaultPlan\\\"\s*:\s*\{\s*\\\"id\\\"\s*:\s*\\\"(plan_[A-Za-z0-9]+)\\\"',
-        ]:
-            m = re.search(pat, r.text)
+                plan_id = m.group(1)
+                checkout_url = f"{self.base_url}/checkout/{plan_id}"
+                r2 = self.session.get(checkout_url)
+                if r2.status_code == 200:
+                    funnel_id2, plan_id2 = _try_extract(r2.text)
+                    funnel_id = funnel_id2 or funnel_id
+                    plan_id   = plan_id2   or plan_id
+
+        # If plan_id in the URL itself (e.g. /checkout/plan_xxx)
+        if not plan_id:
+            m = re.search(r'/checkout/(plan_[A-Za-z0-9]+)', product_url)
             if m:
-                plan_id = m.group(1); break
-        if not funnel_id or not plan_id:
-            raise Exception("Failed to extract funnel/plan IDs from product page")
-        return funnel_id, plan_id
+                plan_id = m.group(1)
+
+        if not plan_id:
+            raise Exception(
+                "Could not find plan ID.\n\n"
+                "Try using the direct buy URL instead:\n"
+                "<code>https://whop.com/checkout/plan_XXXXXX</code>"
+            )
+
+        # funnel_id can be None for plan-only checkouts — Whop handles it
+        return funnel_id or "", plan_id
 
     def create_checkout_session(self, funnel_id: str, plan_id: str) -> Dict:
         url     = f"{self.base_url}/checkout/api/"
