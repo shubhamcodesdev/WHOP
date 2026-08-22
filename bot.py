@@ -1605,10 +1605,36 @@ async def cmd_delproxy(message: Message, state: FSMContext):
     uid     = message.from_user.id
     proxies = user_proxies.get(uid, [])
     parts   = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Usage: /delproxy &lt;number&gt;  (see /proxies for list)", parse_mode="HTML")
+
+    if len(parts) < 2:
+        await message.answer(
+            "Usage:\n"
+            "  <code>/delproxy all</code>  — remove all proxies\n"
+            "  <code>/delproxy &lt;n&gt;</code>    — remove proxy #n (see /proxies)",
+            parse_mode="HTML",
+        )
         return
-    idx = int(parts[1]) - 1
+
+    arg = parts[1].strip().lower()
+
+    # /delproxy all
+    if arg == "all":
+        count = len(proxies)
+        if count == 0:
+            await message.answer("🌐 No proxies to remove.")
+            return
+        user_proxies[uid] = []
+        await message.answer(f"🗑️ All <b>{count}</b> proxy(s) cleared.", parse_mode="HTML")
+        return
+
+    # /delproxy <n>
+    if not arg.isdigit():
+        await message.answer(
+            "❌ Invalid argument. Use <code>/delproxy all</code> or <code>/delproxy &lt;n&gt;</code>.",
+            parse_mode="HTML",
+        )
+        return
+    idx = int(arg) - 1
     if idx < 0 or idx >= len(proxies):
         await message.answer(f"❌ Invalid number. You have {len(proxies)} proxy(s).")
         return
@@ -1617,6 +1643,7 @@ async def cmd_delproxy(message: Message, state: FSMContext):
         f"🗑️ Proxy #{idx+1} removed:\n<code>{removed}</code>\n\nRemaining: {len(proxies)}.",
         parse_mode="HTML",
     )
+
 
 
 @dp.message(Command("checkproxies"))
