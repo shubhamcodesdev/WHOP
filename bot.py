@@ -555,6 +555,39 @@ class WhopCheckout:
                 return False
             return True
 
+        def _extract_anchored_plan(text: str, target_url: str):
+            # 1. Try to find the specific product ID for this page (from og:image or productId)
+            target_prod_id = None
+            m_prod = re.search(r'/prod_([A-Za-z0-9]+)/', text)
+            if not m_prod:
+                m_prod = re.search(r'"productId"\s*:\s*"(prod_[A-Za-z0-9]+)"', text)
+            if m_prod:
+                target_prod_id = m_prod.group(1) if m_prod.group(1).startswith("prod_") else f"prod_{m_prod.group(1)}"
+
+            # If target product ID found, find the plan ID in the JSON snippet near that product ID
+            if target_prod_id:
+                for match in re.finditer(re.escape(target_prod_id), text):
+                    snippet = text[match.start():match.start() + 1500]
+                    p_match = re.search(r'plan_([A-Za-z0-9]{10,24})', snippet)
+                    if p_match:
+                        pid = f"plan_{p_match.group(1)}"
+                        if _is_valid_plan_id(pid):
+                            return pid
+
+            # 2. Try route-anchored search (near product route slug)
+            route_part = target_url.split('?')[0].rstrip('/').split('/')[-1]
+            if route_part and route_part != 'whop.com':
+                r_match = re.search(re.escape(route_part), text)
+                if r_match:
+                    snippet = text[r_match.start():r_match.start() + 1800]
+                    p_match = re.search(r'plan_([A-Za-z0-9]{10,24})', snippet)
+                    if p_match:
+                        pid = f"plan_{p_match.group(1)}"
+                        if _is_valid_plan_id(pid):
+                            return pid
+
+            return None
+
         def _try_extract(text: str):
             funnel_id = plan_id = None
             for pat in [
@@ -565,30 +598,15 @@ class WhopCheckout:
                 if m:
                     funnel_id = m.group(1); break
 
-            for pat in [
-                r'"defaultPlan"\s*:\s*\{\s*"id"\s*:\s*"(plan_[A-Za-z0-9]+)"',
-                r'\\"defaultPlan\\"\s*:\s*\{\s*\\"id\\"\s*:\s*\\"(plan_[A-Za-z0-9]+)\\"',
-            ]:
-                m = re.search(pat, text)
-                if m and _is_valid_plan_id(m.group(1)):
-                    plan_id = m.group(1); break
-            return funnel_id, plan_id
+            return funnel_id, None
 
-        def _broad_plan_id(text: str):
-            candidates = re.findall(r'plan_([A-Za-z0-9_-]{10,24})', text)
-            for c in candidates:
-                pid = f"plan_{c}"
-                if _is_valid_plan_id(pid):
-                    return pid
-            return None
-
-        # Try original URL first without allowing redirect to store root
+        # Try original URL first
         try:
             r = self.session.get(clean_url, allow_redirects=True)
             if r.status_code == 200:
-                f, p = _try_extract(r.text)
-                if not p:
-                    p = _broad_plan_id(r.text)
+                f, _ = _try_extract(r.text)
+                # First try anchored plan extraction (matches target product ID)
+                p = _extract_anchored_plan(r.text, clean_url)
                 if not p:
                     m = re.search(r'href=["\']https://whop\.com/checkout/(plan_[A-Za-z0-9]+)', r.text)
                     if m and _is_valid_plan_id(m.group(1)):
