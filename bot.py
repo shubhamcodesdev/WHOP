@@ -520,25 +520,40 @@ class WhopCheckout:
     def get_product_page(self, product_url: str) -> Tuple[str, str]:
         """
         Resolve any Whop URL format and extract (funnel_id, plan_id).
-
-        Handles:
-          1. Direct buy page        — has funnelId + defaultPlan in JSON
-          2. /username/products/slug — strips /products/, retries
-          3. /username/slug          — two-segment user-scoped URL, try as-is first
-          4. Product landing page   — plan_id as raw text token in HTML
-          5. /checkout/plan_xxx     — plan_id in URL itself
-          6. Affiliate ?a= param    — stored as self.affiliate_code
+        Prevent redirecting to main store homepage (which pulls default product A instead of product B).
         """
-        # Extract and strip affiliate code from URL
         from urllib.parse import urlparse, parse_qs
-        parsed   = urlparse(product_url)
-        qs       = parse_qs(parsed.query)
-        aff      = qs.get('a', [None])[0]
+        parsed = urlparse(product_url)
+        qs     = parse_qs(parsed.query)
+        aff    = qs.get('a', [None])[0]
         if aff:
             self.affiliate_code = aff
-            self._setup_cookies()   # refresh cookies with new affiliate code
+            self._setup_cookies()
+
         clean_url = product_url.split('?')[0].rstrip('/') + '/'
         self.product_url = clean_url
+
+        # Direct plan ID in input
+        direct_plan = re.search(r'(plan_[A-Za-z0-9]{10,24})', product_url)
+        
+        def _is_valid_plan_id(plan_id: str) -> bool:
+            if not plan_id or not plan_id.startswith('plan_'):
+                return False
+            code = plan_id[5:]
+            if len(code) < 10 or len(code) > 24:
+                return False
+            # Reject dummy strings like XXXXXXXXX or AAAAAAAA
+            if len(set(code.upper())) <= 2:
+                return False
+            # Reject translation/i18n keys
+            ignored = [
+                'successfully', 'description', 'embedded', 'hosted', 'cancelled',
+                'will', 'prevent', 'action', 'cannot', 'undone', 'priority', 'student',
+                'types', 'base', 'management', 'deleted', 'updated', 'payouts', 'agreements'
+            ]
+            if any(w in code.lower() for w in ignored):
+                return False
+            return True
 
         def _try_extract(text: str):
             funnel_id = plan_id = None
@@ -549,88 +564,66 @@ class WhopCheckout:
                 m = re.search(pat, text)
                 if m:
                     funnel_id = m.group(1); break
+
             for pat in [
                 r'"defaultPlan"\s*:\s*\{\s*"id"\s*:\s*"(plan_[A-Za-z0-9]+)"',
                 r'\\"defaultPlan\\"\s*:\s*\{\s*\\"id\\"\s*:\s*\\"(plan_[A-Za-z0-9]+)\\"',
             ]:
                 m = re.search(pat, text)
-                if m:
+                if m and _is_valid_plan_id(m.group(1)):
                     plan_id = m.group(1); break
             return funnel_id, plan_id
 
         def _broad_plan_id(text: str):
-            """
-            Fallback: find any plan_Xxxx token in the page.
-            Real IDs always contain at least one uppercase letter (not 'plan_successfully' etc).
-            """
-            candidates = re.findall(r'plan_([A-Za-z0-9]{8,})', text)
+            candidates = re.findall(r'plan_([A-Za-z0-9_-]{10,24})', text)
             for c in candidates:
-                if any(ch.isupper() for ch in c):   # real IDs have uppercase
-                    return f'plan_{c}'
+                pid = f"plan_{c}"
+                if _is_valid_plan_id(pid):
+                    return pid
             return None
 
-        def _fetch(url: str):
-            try:
-                r = self.session.get(url)
-                return r if r.status_code == 200 else None
-            except Exception:
-                return None
+        # Try original URL first without allowing redirect to store root
+        try:
+            r = self.session.get(clean_url, allow_redirects=True)
+            if r.status_code == 200:
+                f, p = _try_extract(r.text)
+                if not p:
+                    p = _broad_plan_id(r.text)
+                if not p:
+                    m = re.search(r'href=["\']https://whop\.com/checkout/(plan_[A-Za-z0-9]+)', r.text)
+                    if m and _is_valid_plan_id(m.group(1)):
+                        p = m.group(1)
+                if p:
+                    return f or "", p
+        except Exception:
+            pass
 
-        # ---- URL normalisation strategies ----
-        # 1. Try original URL as-is (most specific first)
-        # 2. /username/products/slug/ → /slug/
+        # If direct plan ID was provided in URL/string
+        if direct_plan and _is_valid_plan_id(direct_plan.group(1)):
+            return "", direct_plan.group(1)
+
+        # Handle /username/products/slug -> /username/products/slug
         url_no_products = re.sub(
-            r'(https://whop\.com)/[^/]+/products/([^/]+)/?$',
+            r'(https://whop\.com/[^/]+)/products/([^/]+)/?$',
             r'\1/\2/', clean_url
         )
-        # 3. /username/slug/ → /slug/ (strip username prefix)
-        path_parts = [p for p in parsed.path.strip('/').split('/') if p]
-        url_no_user = (f"{self.base_url}/{path_parts[-1]}/"
-                       if len(path_parts) >= 2 else None)
-        # 4. /checkout/plan_xxx already in URL
-        url_checkout_in_url = re.search(r'/checkout/(plan_[A-Za-z0-9]+)', clean_url)
+        if url_no_products != clean_url:
+            try:
+                r = self.session.get(url_no_products, allow_redirects=False)
+                if r.status_code == 200:
+                    f, p = _try_extract(r.text)
+                    if not p:
+                        p = _broad_plan_id(r.text)
+                    if p:
+                        return f or "", p
+            except Exception:
+                pass
 
-        # Build ordered deduped candidate list — try original first, then simplifications
-        candidates_urls = list(dict.fromkeys(filter(None, [
-            clean_url,            # 1. original as-is
-            url_no_products,      # 2. without /products/ segment
-            url_no_user,          # 3. without username prefix
-        ])))
-
-        # Try all candidates — pick first one that yields a plan_id
-        page = funnel_id = plan_id = None
-        for try_url in candidates_urls:
-            r = _fetch(try_url)
-            if not r:
-                continue
-            f, p = _try_extract(r.text)
-            if not p:
-                p = _broad_plan_id(r.text)
-            if not p:
-                m = re.search(r'href=["\']https://whop\.com/checkout/(plan_[A-Za-z0-9]+)', r.text)
-                if m:
-                    p = m.group(1)
-            if p:
-                funnel_id, plan_id, page = f, p, r
-                break
-            elif not page:
-                page = r   # keep a page ref even if no plan found
-
-        # plan_id baked into the original URL itself
-        if not plan_id and url_checkout_in_url:
-            plan_id = url_checkout_in_url.group(1)
-
-        if not page:
-            raise Exception(f"Failed to load product page — tried: {candidates_urls}")
-
-        if not plan_id:
-            raise Exception(
-                "Could not find plan ID.\n\n"
-                "Try the direct checkout URL:\n"
-                "<code>https://whop.com/checkout/plan_XXXXXX</code>"
-            )
-
-        return funnel_id or "", plan_id
+        raise Exception(
+            "Could not extract plan ID for this product.\n\n"
+            "Please use the direct checkout URL:\n"
+            "<code>https://whop.com/checkout/plan_XXXXXX</code>"
+        )
 
     def create_checkout_session(self, funnel_id: str, plan_id: str) -> Dict:
         url     = f"{self.base_url}/checkout/api/"
