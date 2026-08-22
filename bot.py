@@ -664,6 +664,7 @@ class WhopCheckout:
             raise Exception("No checkout session")
         url     = f"{self.base_url}/checkout/{self.checkout_id}/api/?secret={quote(self.secret, safe='')}"
         headers = {'content-type': 'text/plain;charset=UTF-8',
+                   'x-csrf': self.csrf_token,
                    'x-whop-anonymous-id': self.anonymous_id,
                    'origin': self.base_url,
                    'referer': self._referer(),
@@ -671,6 +672,48 @@ class WhopCheckout:
         r = self.session.patch(url, json={"email_preload": email}, headers=headers)
         if r.status_code not in [200, 201]:
             raise Exception(f"Failed to preload email: {r.status_code}")
+        return r.json()
+
+    def update_checkout_details(self, email: str, billing_address: Dict) -> Dict:
+        """Phase 1 of two-phase submit: push email + billing with complete=False.
+        This mimics a real browser filling the form before clicking Pay.
+        """
+        if not self.checkout_id or not self.secret:
+            raise Exception("No checkout session")
+        headers = {
+            'accept':              '*/*',
+            'accept-language':     self.profile.accept_language,
+            'content-type':        'text/plain;charset=UTF-8',
+            'origin':              self.base_url,
+            'priority':            'u=1, i',
+            'referer':             self._referer(),
+            'sec-ch-ua':           self.profile.sec_ch_ua,
+            'sec-ch-ua-mobile':    '?0',
+            'sec-ch-ua-platform':  f'"{self.profile.platform_name}"',
+            'sec-fetch-dest':      'empty',
+            'sec-fetch-mode':      'cors',
+            'sec-fetch-site':      'same-origin',
+            'sec-gpc':             '1',
+            'user-agent':          self.profile.user_agent,
+            'x-csrf':              self.csrf_token,
+            'x-whop-anonymous-id': self.anonymous_id,
+        }
+        payload = {
+            'complete':        False,
+            'tax':             0,
+            'line_items':      [],
+            'email':           email,
+            'billing_address': billing_address,
+            'vat_id':          '',
+        }
+        r = self.session.patch(
+            self.checkout_api_url,
+            params={'secret': self.secret},
+            headers=headers,
+            data=json.dumps(payload),
+        )
+        if r.status_code not in [200, 201, 422]:
+            raise Exception(f"Failed to update checkout details: {r.status_code}")
         return r.json()
 
     def tokenize_card(self, card_number: str, exp_month: int, exp_year: int, cvc: str) -> str:
@@ -706,35 +749,52 @@ class WhopCheckout:
         return r.json().get('id')
 
     def submit_payment(self, email: str, card_token: str, billing_address: Dict, otp: str = None) -> Dict:
+        """Phase 2 of two-phase submit: attach payment method with complete=True."""
         if not self.checkout_id or not self.secret:
             raise Exception("No checkout session")
         headers = {
-            'accept':             '*/*',
-            'accept-language':    self.profile.accept_language,
-            'content-type':       'text/plain;charset=UTF-8',
-            'origin':             self.base_url,
-            'priority':           'u=1, i',
-            'referer':            self._referer(),
-            'sec-ch-ua':          self.profile.sec_ch_ua,
-            'sec-ch-ua-mobile':   '?0',
-            'sec-ch-ua-platform': f'"{self.profile.platform_name}"',
-            'sec-fetch-dest':     'empty',
-            'sec-fetch-mode':     'cors',
-            'sec-fetch-site':     'same-origin',
-            'sec-gpc':            '1',
-            'user-agent':         self.profile.user_agent,
+            'accept':              '*/*',
+            'accept-language':     self.profile.accept_language,
+            'content-type':        'text/plain;charset=UTF-8',
+            'origin':              self.base_url,
+            'priority':            'u=1, i',
+            'referer':             self._referer(),
+            'sec-ch-ua':           self.profile.sec_ch_ua,
+            'sec-ch-ua-mobile':    '?0',
+            'sec-ch-ua-platform':  f'"{self.profile.platform_name}"',
+            'sec-fetch-dest':      'empty',
+            'sec-fetch-mode':      'cors',
+            'sec-fetch-site':      'same-origin',
+            'sec-gpc':             '1',
+            'user-agent':          self.profile.user_agent,
+            'x-csrf':              self.csrf_token,       # ← was missing, triggers before_checkout decline
             'x-whop-anonymous-id': self.anonymous_id,
         }
         device_info = self.profile.payment_device_info()
-        payload = {"complete": True, "tax": 0, "line_items": [], "email": email,
-                   "billing_address": billing_address, "vat_id": "",
-                   "payment_method": {"use": {"processor": "multi_psp", "token": card_token,
-                                              "type": "basis_theory_card_token",
-                                              "device_info": device_info}}}
+        payload = {
+            'complete':        True,
+            'tax':             0,
+            'line_items':      [],
+            'email':           email,
+            'billing_address': billing_address,
+            'vat_id':          '',
+            'payment_method':  {
+                'use': {
+                    'processor':   'multi_psp',
+                    'token':       card_token,
+                    'type':        'basis_theory_card_token',
+                    'device_info': device_info,
+                }
+            },
+        }
         if otp:
-            payload["otp"] = otp
-        r = self.session.patch(self.checkout_api_url, params={'secret': self.secret},
-                               headers=headers, data=json.dumps(payload))
+            payload['otp'] = otp
+        r = self.session.patch(
+            self.checkout_api_url,
+            params={'secret': self.secret},
+            headers=headers,
+            data=json.dumps(payload),
+        )
         if r.status_code not in [200, 201, 422]:
             raise Exception(f"Failed to submit payment: {r.status_code}")
         return r.json()
@@ -817,13 +877,37 @@ class WhopCheckout:
         self.card_token      = None
         try:
             funnel_id, plan_id = self.get_product_page(product_url)
+
+            # Small pause — simulate user reading the product page
+            time.sleep(random.uniform(1.2, 2.8))
+
             self.create_checkout_session(funnel_id, plan_id)
+
+            # Simulate user typing their email into the form
+            time.sleep(random.uniform(0.8, 1.8))
             self.preload_email(email)
-            card_token       = self.tokenize_card(card_info['number'], card_info['exp_month'],
-                                                  card_info['exp_year'], card_info['cvc'])
-            self.card_token  = card_token
+
+            # ── Phase 1: push email + billing (complete=False) ────────────────
+            # Real browsers send this PATCH before even touching the card fields.
+            time.sleep(random.uniform(0.5, 1.2))
+            self.update_checkout_details(email, billing_address)
+
+            # Simulate user filling in card details (iframe load + typing)
+            time.sleep(random.uniform(2.5, 5.0))
+
+            card_token      = self.tokenize_card(
+                card_info['number'], card_info['exp_month'],
+                card_info['exp_year'], card_info['cvc'],
+            )
+            self.card_token = card_token
+
+            # Tiny pause after tokenization (iframe posts the token, then JS calls PATCH)
+            time.sleep(random.uniform(0.4, 1.0))
+
+            # ── Phase 2: attach payment + complete=True ───────────────────────
             self.submit_payment(email, card_token, billing_address)
-            status_result    = self.check_payment_status()
+
+            status_result = self.check_payment_status()
             if status_result.get('action_required') and status_result.get('action') == 'login':
                 otp_result = self.handle_otp_verification()
                 if otp_result.get('success'):
@@ -833,10 +917,14 @@ class WhopCheckout:
                         'error': otp_result.get('error')}
             if status_result.get('payment_success'):
                 return {'success': True, 'email': email, 'checkout_id': self.checkout_id}
-            return {'success': False, 'email': email, 'checkout_id': self.checkout_id,
-                    'failure_message': status_result.get('failure_message', 'Payment failed'),
-                    'failure_status':  status_result.get('failure_status'),
-                    'failure_stage':   status_result.get('failure_stage')}
+            return {
+                'success':         False,
+                'email':           email,
+                'checkout_id':     self.checkout_id,
+                'failure_message': status_result.get('failure_message', 'Payment failed'),
+                'failure_status':  status_result.get('failure_status'),
+                'failure_stage':   status_result.get('failure_stage'),
+            }
         except Exception as e:
             return {'success': False, 'email': email, 'error': str(e)}
 
