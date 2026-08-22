@@ -1012,14 +1012,42 @@ def _build_proxy_dict(proxy_str: str) -> dict:
 
 
 def _test_proxy_sync(proxy_str: str) -> bool:
+    """
+    Two-stage proxy validation:
+      1. Basic connectivity — can it reach the internet at all?
+      2. Whop-compatibility — does Whop's checkout page return 200?
+         Proxies that return 403, 407, 429, 5xx or a payment-wall page
+         are rejected here before they silently break checkouts.
+    """
     try:
         pd = _build_proxy_dict(proxy_str)
         s  = requests.Session()
         s.proxies.update(pd)
         s.verify = False
         s.mount('https://', SSLAdapter())
-        r = s.get('https://api.ipify.org', timeout=12)
-        return r.status_code == 200
+        s.headers.update({'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+
+        # Stage 1 — basic internet connectivity
+        r1 = s.get('https://api.ipify.org', timeout=12)
+        if r1.status_code != 200:
+            return False
+
+        # Stage 2 — Whop-compatibility check
+        # Hit the Whop checkout API endpoint; anything other than 200/201/400/404
+        # (400/404 are expected — the endpoint exists but needs a valid session)
+        # means the proxy is blocked, behind a payment wall, or throwing errors.
+        r2 = s.get('https://whop.com/checkout/api/', timeout=15,
+                   headers={'accept': 'application/json', 'x-csrf': 'test'})
+        bad_codes = {403, 407, 429, 500, 502, 503, 504}
+        if r2.status_code in bad_codes:
+            return False
+        # Some proxies return 200 but with a captcha/payment-wall HTML body
+        body_low = r2.text[:400].lower()
+        if any(kw in body_low for kw in ('payment required', 'captcha', 'access denied',
+                                          'blocked', 'authenticate', 'proxy auth')):
+            return False
+
+        return True
     except Exception:
         return False
 
@@ -1029,12 +1057,15 @@ async def test_proxy(proxy_str: str) -> bool:
     return await loop.run_in_executor(executor, _test_proxy_sync, proxy_str)
 
 
-def get_user_proxy(uid: int) -> Optional[dict]:
+def get_user_proxy(uid: int) -> tuple[Optional[dict], Optional[str]]:
+    """Returns (proxy_dict, raw_proxy_string) — both None if no proxies set.
+    Rotates randomly across the full list on every call.
+    """
     proxies = user_proxies.get(uid, [])
     if not proxies:
-        return None
+        return None, None
     raw = random.choice(proxies)
-    return _build_proxy_dict(raw)
+    return _build_proxy_dict(raw), raw
 
 
 def has_proxy(uid: int) -> bool:
@@ -1267,7 +1298,7 @@ async def _process_product_url(message: Message, state: FSMContext, url: str):
         return
 
     msg   = await message.answer("🔍 <b>Validating product URL...</b>", parse_mode="HTML")
-    proxy = get_user_proxy(uid)
+    proxy, _ = get_user_proxy(uid)
     # Extract affiliate code from URL (e.g. ?a=shubhamind29)
     from urllib.parse import urlparse, parse_qs
     aff_match = parse_qs(urlparse(url).query).get('a', [None])[0]
@@ -1359,12 +1390,16 @@ async def _process_cc(message: Message, state: FSMContext):
     except Exception:
         pass
 
-    proxy        = get_user_proxy(uid)
+    proxy, proxy_chosen = get_user_proxy(uid)
     aff_code     = d.get("affiliate_code")
     card_display = f"{card_info['number'][:6]}xxxxxx{card_info['number'][-4:]}"
     billing      = get_random_billing()
-    proxy_raw    = user_proxies.get(uid, [])
-    proxy_label  = f"🌐 {proxy_raw[0].split(':')[0]}" if proxy_raw else "🌐 No proxy (owner)"
+    # Show which proxy was actually selected this run (not always index 0)
+    if proxy_chosen:
+        _ph = proxy_chosen.split(':')[0]   # host portion only
+        proxy_label = f"🌐 {_ph}"
+    else:
+        proxy_label = "🌐 No proxy (owner)"
 
     msg = await message.answer(
         f"⚙️ <b>Checkout started...</b>\n\n"
@@ -1379,7 +1414,7 @@ async def _process_cc(message: Message, state: FSMContext):
     )
 
     try:
-        result = await async_checkout(product_url, card_info, proxy=proxy, affiliate_code=aff_code)
+        result = await async_checkout(product_url, card_info, proxy=proxy, affiliate_code=aff_code)  # proxy rotated per-run
 
         if result.get("success"):
             text = (
